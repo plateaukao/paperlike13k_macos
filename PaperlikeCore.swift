@@ -69,14 +69,24 @@ class SerialPort {
         }
     }
     
-    func writeString(_ string: String) {
-        guard fileDescriptor != -1 else { return }
+    // Returns false if the write hit a fatal error (device torn down by macOS).
+    // Transient EAGAIN/EWOULDBLOCK under O_NONBLOCK is treated as success.
+    @discardableResult
+    func writeString(_ string: String) -> Bool {
+        guard fileDescriptor != -1 else { return false }
         let data = Array(string.utf8)
-        data.withUnsafeBufferPointer { buffer in
-            _ = write(fileDescriptor, buffer.baseAddress, buffer.count)
+        let result = data.withUnsafeBufferPointer { buffer in
+            write(fileDescriptor, buffer.baseAddress, buffer.count)
         }
+        if result < 0 {
+            let err = errno
+            if err != EAGAIN && err != EWOULDBLOCK {
+                return false
+            }
+        }
+        return true
     }
-    
+
     func readAvailable() -> String {
         guard fileDescriptor != -1 else { return "" }
         var buffer = [UInt8](repeating: 0, count: 1024)
@@ -86,9 +96,16 @@ class SerialPort {
         }
         return ""
     }
-    
+
     func isOpen() -> Bool {
         return fileDescriptor != -1
+    }
+
+    // The /dev node disappears when macOS tears the USB accessory down
+    // (e.g. unplug, or an unapproved accessory under "Allow accessories to
+    // connect"). This is the reliable liveness check on Tahoe 26.6+.
+    func isDevicePresent() -> Bool {
+        return FileManager.default.fileExists(atPath: path)
     }
     
     static func findWCHPort() -> String? {
@@ -201,6 +218,9 @@ class NativeDaemonManager: ObservableObject {
     private var readBuffer: String = ""
     private let queue = DispatchQueue(label: "com.paperlike.serialQueue")
     private let modeDefaultsKey = "paperlikeMode"
+    private var lastConnectTime: Date?
+    private var quickDropCount: Int = 0
+    private let accessoryHint = "Display detected but disconnected by macOS. Open System Settings → Privacy & Security → “Allow accessories to connect” and choose “Automatically When Unlocked”, then re-plug the display."
     
     init() {
         if UserDefaults.standard.object(forKey: modeDefaultsKey) != nil {
@@ -217,11 +237,12 @@ class NativeDaemonManager: ObservableObject {
             let port = SerialPort(path: portPath)
             if port.openPort() {
                 self.serialPort = port
+                self.lastConnectTime = Date()
                 DispatchQueue.main.async {
                     self.isConnected = true
                     self.lastError = ""
                 }
-                
+
                 print("Connected to \(portPath), draining...")
                 _ = port.readAvailable()
                 
@@ -254,11 +275,16 @@ class NativeDaemonManager: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.queue.async {
-                if let port = self.serialPort, port.isOpen() {
+                if let port = self.serialPort, port.isOpen(), port.isDevicePresent() {
                     _ = port.readAvailable()
+                    // sendCommand tears down and flips isConnected on a fatal write.
                     self.sendCommand(cmd: 0x20, opt: 0x01)
                 } else {
-                    // Try to reconnect
+                    // Device node gone (unplug or accessory torn down by macOS)
+                    // or never connected — clean up any stale fd, then reconnect.
+                    if self.serialPort != nil {
+                        self.handleDisconnect()
+                    }
                     self.connectAndInit()
                 }
             }
@@ -290,12 +316,36 @@ class NativeDaemonManager: ObservableObject {
         queue.async { self.sendCommand(cmd: 0x03, opt: 0x01) }
     }
     
-    private func sendCommand(cmd: UInt8, opt: UInt8) {
-        guard let port = serialPort, port.isOpen() else { return }
+    @discardableResult
+    private func sendCommand(cmd: UInt8, opt: UInt8) -> Bool {
+        guard let port = serialPort, port.isOpen() else { return false }
         let packet = PaperlikeProtocol.makePacket(cmd: cmd, opt: opt)
-        port.writeString(packet)
+        let ok = port.writeString(packet)
         // give it time to flush on native IO
         usleep(100_000)
+        if !ok {
+            print("Write failed — device likely torn down by macOS.")
+            handleDisconnect()
+        }
+        return ok
+    }
+
+    // Close a dead port and reflect the disconnect. If the device kept dropping
+    // shortly after connecting, it's almost certainly the macOS accessory-approval
+    // security tearing it down, so surface actionable guidance.
+    private func handleDisconnect() {
+        let wasQuick = lastConnectTime.map { Date().timeIntervalSince($0) < 20 } ?? false
+        serialPort?.closePort()
+        serialPort = nil
+        lastConnectTime = nil
+        if wasQuick { quickDropCount += 1 } else { quickDropCount = 0 }
+        let showHint = quickDropCount >= 2
+        DispatchQueue.main.async {
+            self.isConnected = false
+            if showHint {
+                self.lastError = self.accessoryHint
+            }
+        }
     }
     
     private func queryExistingSettings() {

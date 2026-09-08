@@ -244,6 +244,13 @@ struct ContentView: View {
                     Text(manager.lastError)
                         .font(.caption)
                         .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Open Privacy & Security…") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .font(.caption)
                 }
             }
 

@@ -66,6 +66,29 @@ In daemon mode, the script handles USB disconnect and reconnect automatically.
 When the display is unplugged, it waits for the device to reappear (the serial
 port path may change, e.g. `cu.usbserial-1410` -> `cu.usbserial-1420`) and re-runs the full init.
 
+## Native app on macOS Tahoe 26.6+
+
+The bundled `PaperlikeNative.app` connects to the display over the same CH340 serial
+port. Two macOS security changes introduced during the Tahoe 26.x cycle can make it
+"connect once then disconnect" on other machines even though it works on the machine
+it was built on:
+
+1. **Gatekeeper quarantine.** A downloaded build is quarantined and blocked (the app is
+   ad-hoc signed, not notarized). On the target Mac, clear it once:
+   ```bash
+   xattr -dr com.apple.quarantine PaperlikeNative.app
+   ```
+   (or right-click the app → **Open** the first time).
+
+2. **"Allow accessories to connect"** (Apple Silicon laptops). The default *"Ask for new
+   accessories"* can tear the USB serial device down right after it connects. Go to
+   **System Settings → Privacy & Security → Allow accessories to connect** and choose
+   **Automatically When Unlocked**, then re-plug the display. When the app keeps losing
+   the connection it now shows this hint and a shortcut button to that settings pane.
+
+The app detects the device being torn down (the `/dev/cu.*` node disappearing or a write
+failing) and automatically reconnects once the device is available and approved.
+
 ## Hardware
 
 - **Display**: Paperlike 13K 2025 Color, 3200x2400 @ 37Hz
